@@ -19,6 +19,7 @@ export interface DhcpLease {
   description?: string;     // Alternative description field
   type?: string;            // Lease type
   man?: string;             // Manufacturer
+  source?: string;          // Lease backend: kea, dnsmasq or isc
 }
 
 export interface DhcpStaticMapping {
@@ -65,76 +66,74 @@ export class DhcpLeaseResource {
       state: rawLease.state || rawLease.status || 'unknown',
       act: rawLease.act || rawLease.action || '',
       wstatus: rawLease.wstatus || rawLease.status || '',
-      if: rawLease.if || rawLease.interface || rawLease.intf || ''
+      if: rawLease.if_descr || rawLease.if_name || rawLease.if || rawLease.interface || rawLease.intf || '',
+      man: rawLease.mac_info || rawLease.man || ''
     };
   }
 
   /**
-   * List all DHCP leases with improved error handling
+   * Lease backends, newest first. OPNsense moved from ISC dhcpd to Kea and
+   * dnsmasq; a router may answer on several of them (an old dnsmasq lease file
+   * can linger after switching to Kea), so all are read and merged.
+   */
+  private static readonly LEASE_BACKENDS: Array<{ source: string; path: string }> = [
+    { source: 'kea', path: '/kea/leases4/search' },
+    { source: 'dnsmasq', path: '/dnsmasq/leases/search' },
+    { source: 'isc', path: '/dhcpv4/leases/searchLease' },
+  ];
+
+  /**
+   * List DHCP leases from every lease backend the router answers on, merged by
+   * MAC address; when a MAC appears in several backends the lease that expires
+   * last wins. Each lease carries its `source` backend.
    */
   async listLeases(): Promise<DhcpLease[]> {
-    try {
-      if (this.debugMode) {
-        logger.debug('[DHCP] Calling searchLease endpoint...');
-      }
+    const byKey = new Map<string, { lease: DhcpLease; expire: number }>();
+    let answered = 0;
 
-      const response = await this.client.post('/dhcpv4/leases/searchLease', {
-        current: 1,
-        rowCount: 1000,
-        sort: {},
-        searchPhrase: ''
-      });
-
-      if (this.debugMode) {
-        logger.debug('[DHCP] Raw response:', JSON.stringify(response, null, 2));
-      }
-
-      // Handle different response formats
-      let leases: any[] = [];
-      
-      if (response && response.rows && Array.isArray(response.rows)) {
-        leases = response.rows;
-      } else if (response && response.leases && Array.isArray(response.leases)) {
-        leases = response.leases;
-      } else if (Array.isArray(response)) {
-        leases = response;
-      } else if (response && response.data && Array.isArray(response.data)) {
-        leases = response.data;
-      }
-
-      if (this.debugMode) {
-        logger.debug(`[DHCP] Found ${leases.length} leases`);
-        if (leases.length > 0) {
-          logger.debug('[DHCP] First lease:', JSON.stringify(leases[0], null, 2));
-        }
-      }
-
-      // Normalize the lease data
-      return leases.map(lease => this.normalizeLease(lease));
-    } catch (error) {
-      if (this.debugMode) {
-        logger.error('[DHCP] Failed to list leases:', error);
-      }
-      
-      // Try alternative endpoint
+    for (const backend of DhcpLeaseResource.LEASE_BACKENDS) {
+      let rows: any[] = [];
       try {
-        if (this.debugMode) {
-          logger.debug('[DHCP] Trying alternative endpoint...');
+        const response = await this.client.post(backend.path, {
+          current: 1,
+          rowCount: 1000,
+          sort: {},
+          searchPhrase: ''
+        });
+        if (response && Array.isArray(response.rows)) {
+          rows = response.rows;
+        } else if (response && Array.isArray(response.leases)) {
+          rows = response.leases;
+        } else if (Array.isArray(response)) {
+          rows = response;
         }
-        
-        const altResponse = await this.client.get('/dhcpv4/leases');
-        if (altResponse && Array.isArray(altResponse)) {
-          return altResponse.map((lease: any) => this.normalizeLease(lease));
-        }
-      } catch (altError) {
+        answered++;
+      } catch (error) {
         if (this.debugMode) {
-          logger.error('[DHCP] Alternative endpoint also failed:', altError);
+          logger.debug(`[DHCP] ${backend.source} lease backend unavailable:`, error);
+        }
+        continue;
+      }
+
+      for (const raw of rows) {
+        const lease = { ...this.normalizeLease(raw), source: backend.source };
+        const expire = Number(raw.expire ?? 0) || 0;
+        if (expire > 0 && !lease.ends) {
+          lease.ends = new Date(expire * 1000).toISOString();
+        }
+        const key = (lease.hwaddr || lease.address).toLowerCase();
+        if (!key) continue;
+        const existing = byKey.get(key);
+        if (!existing || expire > existing.expire) {
+          byKey.set(key, { lease, expire });
         }
       }
-      
-      logger.error('Failed to list DHCP leases:', error instanceof Error ? error.message : 'Unknown error');
-      return [];
     }
+
+    if (answered === 0) {
+      logger.error('Failed to list DHCP leases: no lease backend (Kea, dnsmasq, ISC) answered');
+    }
+    return [...byKey.values()].map(v => v.lease);
   }
 
   /**
