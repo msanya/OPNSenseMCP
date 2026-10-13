@@ -41,7 +41,7 @@ const ORIGINAL_ENV = { ...process.env };
 
 beforeEach(() => {
   vi.resetModules();
-  process.env = { ...ORIGINAL_ENV, OPNSENSE_SSH_HOST: 'opnsense.example.test', OPNSENSE_SSH_PASSWORD: 'x' };
+  process.env = { ...ORIGINAL_ENV, OPNSENSE_SSH_ENABLED: 'true', OPNSENSE_SSH_HOST: 'opnsense.example.test', OPNSENSE_SSH_PASSWORD: 'x' };
 });
 
 afterEach(() => {
@@ -165,5 +165,55 @@ describe('SSHExecutor normal mode (regression)', () => {
 
     expect(result.success).toBe(false);
     expect(result.stderr).toMatch(/not in whitelist/i);
+  });
+});
+
+describe('SSHExecutor opt-in (OPNSENSE_SSH_ENABLED)', () => {
+  it('refuses every command and never connects when SSH is not enabled', async () => {
+    delete process.env.OPNSENSE_SSH_ENABLED;
+    const { SSHExecutor } = await import('../../src/resources/ssh/executor.js');
+    const { Client } = await import('ssh2');
+    vi.mocked(Client).mockClear();
+    const executor = new SSHExecutor();
+
+    const result = await executor.execute('uptime');
+
+    expect(result.success).toBe(false);
+    expect(result.stderr).toMatch(/SSH is disabled/);
+    expect(Client).not.toHaveBeenCalled();
+    await expect(executor.connect()).rejects.toThrow(/SSH is disabled/);
+  });
+
+  it('does not fall back to ~/.ssh/id_rsa when no key path is configured', async () => {
+    delete process.env.OPNSENSE_SSH_KEY_PATH;
+    const { SSHExecutor } = await import('../../src/resources/ssh/executor.js');
+    const executor = new SSHExecutor() as any;
+    expect(executor.config.privateKeyPath).toBeUndefined();
+  });
+});
+
+describe('SSHExecutor read-only mode: chained commands', () => {
+  const bypasses = [
+    'cat /dev/null; reboot',
+    'cat x && pfctl -d',
+    'cat x | sh',
+    'cat $(reboot)',
+    'cat `reboot`',
+    'grep a b > /conf/config.xml',
+    'ls\nreboot',
+  ];
+
+  it.each(bypasses)('blocks %j even though it starts with a read-only command', async (command) => {
+    process.env.OPNSENSE_READ_ONLY = 'true';
+    const { SSHExecutor } = await import('../../src/resources/ssh/executor.js');
+    const { Client } = await import('ssh2');
+    vi.mocked(Client).mockClear();
+    const executor = new SSHExecutor();
+
+    const result = await executor.execute(command);
+
+    expect(result.success).toBe(false);
+    expect(result.stderr).toMatch(/read-only mode/i);
+    expect(Client).not.toHaveBeenCalled();
   });
 });

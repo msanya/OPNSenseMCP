@@ -63,7 +63,8 @@ import SystemSettingsResource from './resources/system/settings.js';
 import InterfaceConfigResource from './resources/network/interfaces.js';
 import RoutingDiagnosticsResource from './resources/diagnostics/routing.js';
 import CLIExecutorResource from './resources/cli/executor.js';
-import SSHExecutor from './resources/ssh/executor.js';
+import SSHExecutor, { SHELL_METACHARS } from './resources/ssh/executor.js';
+import { getSafetyConfig, toolUnavailableReason } from './utils/tool-gating.js';
 import { MonitResource } from './resources/services/monitoring/monit.js';
 import { AcmeClientResource } from './resources/services/acme/client.js';
 
@@ -91,61 +92,14 @@ const ConfigSchema = z.object({
   readOnly: z.boolean().default(false)
 });
 
-/**
- * Safety mode is an operator-controlled setting, not something the model
- * can grant itself. It is always sourced from the environment and applied
- * *after* parsing any client-supplied `configure` args, so a tool call can
- * never widen access beyond what OPNSENSE_DRY_RUN / OPNSENSE_READ_ONLY allow.
- */
-function getSafetyConfig(): { dryRun: boolean; readOnly: boolean } {
-  return {
-    dryRun: process.env.OPNSENSE_DRY_RUN === 'true',
-    readOnly: process.env.OPNSENSE_READ_ONLY === 'true'
-  };
+function assertNoShellMetachars(command: string): void {
+  if (SHELL_METACHARS.test(command)) {
+    throw new McpError(
+      ErrorCode.InvalidRequest,
+      'Command rejected: shell metacharacters (; & | ` $ < > ( ) { } \\ or newline) are not allowed. Run one plain command per call.'
+    );
+  }
 }
-
-/**
- * Tools that mutate router state (create/update/delete/toggle/apply/restore/
- * enable/fix-style operations), used to hide them from ListTools and hard-block
- * them in CallTool when OPNSENSE_READ_ONLY=true. Deliberately excludes
- * ssh_-prefixed and cli_-prefixed tools: those are backed by SSHExecutor/CLIExecutorResource,
- * which already gate per-command (see READ_ONLY_COMMAND_PATTERNS in
- * src/resources/ssh/executor.ts) so read-only diagnostics like
- * ssh_show_pf_rules keep working under OPNSENSE_READ_ONLY instead of being
- * blanket-blocked along with genuinely destructive commands in the same tool.
- * `configure` is also excluded — it only sets up the API connection and is
- * needed to reach a working state in the first place.
- */
-const WRITE_TOOL_NAMES = new Set<string>([
-  'create_vlan', 'update_vlan', 'delete_vlan',
-  'create_firewall_rule', 'create_firewall_preset', 'update_firewall_rule',
-  'delete_firewall_rule', 'toggle_firewall_rule', 'toggle_firewall_rule_log',
-  'restore_backup',
-  'block_domain', 'unblock_domain', 'block_multiple_domains',
-  'apply_blocklist_category', 'toggle_blocklist_entry',
-  'add_dnsbl_subscription', 'remove_dnsbl_subscription', 'update_dnsbl_subscription',
-  'haproxy_service_control',
-  'monit_add_service', 'monit_update_service', 'monit_delete_service',
-  'monit_add_test', 'monit_update_test', 'monit_delete_test',
-  'monit_add_alert', 'monit_update_alert', 'monit_delete_alert',
-  'acme_update_certificate', 'acme_renew_certificate', 'acme_sign_certificate',
-  'acme_revoke_certificate', 'acme_add_action', 'acme_delete_action',
-  'system_enable_intervlan_routing', 'system_update_firewall_settings',
-  'interface_enable_intervlan_routing', 'interface_enable_intervlan_all',
-  'interface_configure_dmz', 'interface_update_config',
-  'routing_fix_all', 'routing_fix_dmz', 'routing_create_intervlan_rules',
-  'haproxy_backend_create', 'haproxy_backend_delete', 'haproxy_backend_update',
-  'haproxy_frontend_create', 'haproxy_frontend_delete', 'haproxy_frontend_update',
-  'haproxy_certificate_create',
-  'haproxy_acl_create', 'haproxy_acl_update', 'haproxy_acl_delete',
-  'haproxy_action_create', 'haproxy_action_update', 'haproxy_action_delete',
-  'haproxy_server_add', 'haproxy_server_update', 'haproxy_server_delete',
-  'macro_play',
-  'iac_apply_deployment', 'iac_destroy_deployment',
-  'nat_set_mode', 'nat_create_outbound_rule', 'nat_delete_outbound_rule',
-  'nat_create_port_forward', 'nat_delete_port_forward',
-  'nat_fix_dmz', 'nat_quick_fix_dmz', 'nat_cleanup_dmz_fix', 'nat_apply_changes'
-]);
 
 class OPNSenseMCPServer {
   private server: Server;
@@ -558,29 +512,41 @@ class OPNSenseMCPServer {
         // Backup Management Tools
         {
           name: 'create_backup',
-          description: 'Create a configuration backup',
+          description: 'Download the current config.xml and save a local copy (mode 0600) under BACKUP_PATH. Returns the file path, never the content. OPNsense also keeps its own history entry for every saved change (see list_backups).',
           inputSchema: {
             type: 'object',
             properties: {
-              description: { type: 'string', description: 'Backup description' }
+              description: { type: 'string', description: 'Short label added to the local file name' }
             }
           }
         },
         {
           name: 'list_backups',
-          description: 'List available backups',
+          description: "List the router's configuration history (/conf/backup), newest first: id, time, user, description, size.",
           inputSchema: {
             type: 'object',
             properties: {}
           }
         },
         {
-          name: 'restore_backup',
-          description: 'Restore a configuration backup',
+          name: 'diff_backups',
+          description: 'Unified diff between two configuration history entries (ids from list_backups).',
           inputSchema: {
             type: 'object',
             properties: {
-              backupId: { type: 'string', description: 'Backup ID to restore' }
+              olderId: { type: 'string', description: 'Older history entry id (config-<timestamp>.xml)' },
+              newerId: { type: 'string', description: 'Newer history entry id (config-<timestamp>.xml)' }
+            },
+            required: ['olderId', 'newerId']
+          }
+        },
+        {
+          name: 'restore_backup',
+          description: "Revert the running configuration to an entry of the router's own configuration history (id from list_backups). Nothing is uploaded from this machine.",
+          inputSchema: {
+            type: 'object',
+            properties: {
+              backupId: { type: 'string', description: 'History entry id (config-<timestamp>.xml) from list_backups' }
             },
             required: ['backupId']
           }
@@ -2450,9 +2416,7 @@ class OPNSenseMCPServer {
       // enforcement is in OPNSenseAPIClient/SSHExecutor (they reject/simulate
       // mutations regardless of which tool called them), but not exposing the
       // tool at all is a stronger guarantee than trusting every call site.
-      const tools = getSafetyConfig().readOnly
-        ? allTools.filter(t => !WRITE_TOOL_NAMES.has(t.name))
-        : allTools;
+      const tools = allTools.filter(t => toolUnavailableReason(t.name) === null);
 
       return { tools };
     });
@@ -2748,11 +2712,9 @@ class OPNSenseMCPServer {
       // calls to a write tool by name even if a client cached an older tool
       // list. The API client / SSH executor would reject the mutation anyway,
       // but failing here is faster and gives a clearer error.
-      if (getSafetyConfig().readOnly && WRITE_TOOL_NAMES.has(name)) {
-        throw new McpError(
-          ErrorCode.InvalidRequest,
-          `Tool '${name}' is unavailable: server is running in read-only mode (OPNSENSE_READ_ONLY=true).`
-        );
+      const unavailable = toolUnavailableReason(name);
+      if (unavailable) {
+        throw new McpError(ErrorCode.InvalidRequest, unavailable);
       }
 
       // Route IaC tools
@@ -3299,12 +3261,12 @@ class OPNSenseMCPServer {
           
           try {
             const backup = await this.backupManager.createBackup({
-              description: args?.description as string || 'Manual backup from Claude'
+              description: args?.description as string | undefined
             });
             return {
               content: [{
                 type: 'text',
-                text: `Backup created successfully:\nID: ${backup.id}\nDescription: ${backup.description}\nTimestamp: ${backup.timestamp}`
+                text: `Configuration copy saved:\nFile: ${backup.file}\nSize: ${backup.size} bytes\nTimestamp: ${backup.timestamp.toISOString()}`
               }]
             };
           } catch (error: any) {
@@ -3333,6 +3295,33 @@ class OPNSenseMCPServer {
           };
         }
 
+        case 'diff_backups': {
+          await this.ensureInitialized();
+          if (!this.backupManager) {
+            throw new McpError(
+              ErrorCode.InternalError,
+              'Backup manager not enabled.'
+            );
+          }
+          if (!args?.olderId || !args?.newerId) {
+            throw new McpError(
+              ErrorCode.InvalidRequest,
+              'olderId and newerId parameters are required'
+            );
+          }
+          try {
+            const lines = await this.backupManager.diffBackups(args.olderId as string, args.newerId as string);
+            return {
+              content: [{
+                type: 'text',
+                text: lines.length ? lines.join('\n') : 'No differences (or one of the ids was not found).'
+              }]
+            };
+          } catch (error: any) {
+            throw new McpError(ErrorCode.InvalidRequest, error.message);
+          }
+        }
+
         case 'restore_backup': {
           await this.ensureInitialized();
           if (!this.backupManager) {
@@ -3354,9 +3343,9 @@ class OPNSenseMCPServer {
             return {
               content: [{
                 type: 'text',
-                text: success ? 
-                  `Backup ${args.backupId} restored successfully` :
-                  `Failed to restore backup ${args.backupId}`
+                text: success ?
+                  `Configuration reverted to ${args.backupId}` :
+                  `Revert to ${args.backupId} was not sent (dry-run mode)`
               }]
             };
           } catch (error: any) {
@@ -4868,6 +4857,9 @@ class OPNSenseMCPServer {
             );
           }
           
+          assertNoShellMetachars(args.command as string);
+          ((args.args as string[]) || []).forEach(a => assertNoShellMetachars(String(a)));
+
           try {
             const result = await this.cliExecutor!.execute({
               command: args.command as string,
@@ -5045,6 +5037,8 @@ class OPNSenseMCPServer {
             );
           }
           
+          assertNoShellMetachars(args.command as string);
+
           try {
             const result = await this.sshExecutor!.execute(
               args.command as string,
@@ -5378,6 +5372,8 @@ class OPNSenseMCPServer {
             );
           }
           
+          (args.commands as string[]).forEach(cmd => assertNoShellMetachars(String(cmd)));
+
           try {
             const result = await this.sshExecutor!.executeBatch(
               args.commands as string[],

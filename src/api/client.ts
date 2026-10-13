@@ -22,6 +22,18 @@ export class OPNSenseAPIError extends Error {
 /**
  * OPNsense API Client with comprehensive functionality and error handling
  */
+/**
+ * True when an API path names a read-only OPNsense action. Paths look like
+ * `/{module}/{controller}/{action}/{params...}` (the `/api` prefix may or may
+ * not be present); by OPNsense convention `search*` and `get*` actions only read.
+ */
+export function isReadOnlyApiAction(path: string): boolean {
+  const segments = path.split('?')[0].split('/').filter(Boolean);
+  if (segments[0] === 'api') segments.shift();
+  const action = segments[2];
+  return typeof action === 'string' && /^(search|get)[A-Za-z0-9_]*$/.test(action);
+}
+
 export class OPNSenseAPIClient {
   private axios: AxiosInstance;
   private debugMode: boolean;
@@ -200,6 +212,13 @@ export class OPNSenseAPIClient {
     path: string,
     data?: any
   ): { result: string; dryRun?: boolean; readOnly?: boolean; message: string; wouldSend?: { method: string; path: string; data?: any } } | undefined {
+    // OPNsense serves its search/get actions over POST too (e.g.
+    // dhcpv4/leases/searchLease). They never change state, so they pass
+    // through even in read-only / dry-run mode.
+    if (method === 'POST' && isReadOnlyApiAction(path)) {
+      return undefined;
+    }
+
     if (this.readOnly) {
       const message = `Blocked ${method} ${path}: client is in read-only mode (OPNSENSE_READ_ONLY). No request was sent.`;
       logger.warn('[API Read-Only] ' + message, { method, path, data });

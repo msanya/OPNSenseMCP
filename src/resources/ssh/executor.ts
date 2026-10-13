@@ -4,8 +4,6 @@
 
 import { Client, ConnectConfig, ClientChannel } from 'ssh2';
 import { promises as fs } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
 import { logger } from '../../utils/logger.js';
 import { EventEmitter } from 'events';
 
@@ -112,6 +110,17 @@ const READ_ONLY_COMMAND_PATTERNS: RegExp[] = [
   /^(sudo\s+)?xmllint\s+--noout\b/,
 ];
 
+// Shell metacharacters that chain, substitute or redirect commands. A command
+// containing any of these is never considered read-only, because the read-only
+// patterns above only anchor the START of the command: `cat x; pfctl -d` would
+// otherwise match /^cat\b/ and run the second command as well.
+export const SHELL_METACHARS = /[;&|`$<>(){}\\\n\r]/;
+
+/** True when the SSH executor may open connections at all (opt-in). */
+export function isSshEnabled(): boolean {
+  return process.env.OPNSENSE_SSH_ENABLED === 'true';
+}
+
 export class SSHExecutor extends EventEmitter {
   private config: SSHConfig;
   private client: Client | null = null;
@@ -153,7 +162,8 @@ export class SSHExecutor extends EventEmitter {
       port: parseInt(process.env.OPNSENSE_SSH_PORT || '22'),
       username: process.env.OPNSENSE_SSH_USERNAME || 'root',
       password: process.env.OPNSENSE_SSH_PASSWORD,
-      privateKeyPath: process.env.OPNSENSE_SSH_KEY_PATH || join(homedir(), '.ssh', 'id_rsa'),
+      // No implicit ~/.ssh/id_rsa: a key is only used when explicitly configured.
+      privateKeyPath: process.env.OPNSENSE_SSH_KEY_PATH,
       passphrase: process.env.OPNSENSE_SSH_PASSPHRASE,
       timeout: parseInt(process.env.OPNSENSE_SSH_TIMEOUT || '30000'),
       keepaliveInterval: parseInt(process.env.OPNSENSE_SSH_KEEPALIVE || '10000'),
@@ -173,6 +183,9 @@ export class SSHExecutor extends EventEmitter {
    * Connect to OPNsense via SSH
    */
   async connect(): Promise<void> {
+    if (!isSshEnabled()) {
+      throw new Error('SSH is disabled (set OPNSENSE_SSH_ENABLED=true to allow SSH access).');
+    }
     if (this.isConnected) {
       return;
     }
@@ -302,6 +315,19 @@ export class SSHExecutor extends EventEmitter {
   async execute(command: string, options?: { timeout?: number; sudo?: boolean }): Promise<CommandResult> {
     // Update last activity
     this.lastActivity = Date.now();
+
+    // SSH is opt-in: without OPNSENSE_SSH_ENABLED=true nothing is ever sent.
+    if (!isSshEnabled()) {
+      return {
+        success: false,
+        stdout: '',
+        stderr: 'Blocked: SSH is disabled (OPNSENSE_SSH_ENABLED is not "true"); this command was not sent.',
+        exitCode: 1,
+        duration: 0,
+        command,
+        timestamp: new Date().toISOString()
+      };
+    }
     
     // Validate command against whitelist
     if (!this.isCommandSafe(command)) {
@@ -558,6 +584,9 @@ export class SSHExecutor extends EventEmitter {
    * explicitly matched here is treated as a potential mutation.
    */
   private isReadOnlyCommand(command: string): boolean {
+    if (SHELL_METACHARS.test(command)) {
+      return false;
+    }
     return READ_ONLY_COMMAND_PATTERNS.some(pattern => pattern.test(command));
   }
 

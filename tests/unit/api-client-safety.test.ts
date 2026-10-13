@@ -93,15 +93,13 @@ describe('OPNSenseAPIClient dry-run mode', () => {
     });
   });
 
-  it('leaves true GET requests unaffected, even though search* helpers are POST-backed and get simulated', async () => {
+  it('sends POST-backed search* reads for real, and leaves GET requests unaffected', async () => {
     const client = new OPNSenseAPIClient(baseConfig({ dryRun: true }));
 
-    // searchFirewallRules() is implemented as a POST to a searchItem endpoint,
-    // so it is a mutation-shaped call as far as the client is concerned and
-    // gets simulated like any other POST.
-    const rules = await client.searchFirewallRules();
-    expect(mockAxiosInstance.post).not.toHaveBeenCalled();
-    expect((rules as any).dryRun).toBe(true);
+    // searchFirewallRules() is a POST to a search* action. It only reads,
+    // so it reaches the router even in dry-run mode.
+    await client.searchFirewallRules();
+    expect(mockAxiosInstance.post).toHaveBeenCalledTimes(1);
 
     // A real GET always goes through untouched.
     await client.get('/core/firmware/info');
@@ -158,5 +156,35 @@ describe('OPNSenseAPIClient read-only mode', () => {
   it('reports isReadOnly() as true', () => {
     const client = new OPNSenseAPIClient(baseConfig({ readOnly: true }));
     expect(client.isReadOnly()).toBe(true);
+  });
+});
+
+describe('read-only POST actions (search*/get*)', () => {
+  it('lets a POST search action through in read-only mode', async () => {
+    const client = new OPNSenseAPIClient(baseConfig({ readOnly: true }));
+
+    await client.post('/dhcpv4/leases/searchLease', { current: 1 });
+
+    expect(mockAxiosInstance.post).toHaveBeenCalledTimes(1);
+  });
+
+  it('still blocks a mutating POST in read-only mode', async () => {
+    const client = new OPNSenseAPIClient(baseConfig({ readOnly: true }));
+
+    await expect(client.post('/core/backup/revertBackup/config-1.xml')).rejects.toBeInstanceOf(OPNSenseAPIError);
+    expect(mockAxiosInstance.post).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['/dhcpv4/leases/searchLease', true],
+    ['/api/firewall/filter/searchRule', true],
+    ['/interfaces/vlan_settings/getItem/abc', true],
+    ['/firewall/filter/addRule', false],
+    ['/core/backup/revertBackup/config-1.xml', false],
+    ['/firewall/filter/apply', false],
+    ['/search', false],
+  ])('isReadOnlyApiAction(%s) === %s', async (path, expected) => {
+    const { isReadOnlyApiAction } = await import('../../src/api/client.js');
+    expect(isReadOnlyApiAction(path)).toBe(expected);
   });
 });
